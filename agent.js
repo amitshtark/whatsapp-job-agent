@@ -19,6 +19,7 @@ const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 const SEEN_FILE_PATH = "./whatsapp_seen.json";
 const DEBOUNCE_MS = (Number(process.env.DEBOUNCE_SECONDS) || 40) * 1000;
 const GITHUB_REFRESH_MS = 30 * 60 * 1000; // רענון משרות מהאתר כל 30 דקות
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-flash-lite-latest";
 
 const ALLOWED_GROUPS = new Set(
   (process.env.ALLOWED_GROUP_JIDS || "")
@@ -104,7 +105,26 @@ function passesPreFilter(combinedText, hasImage) {
   return hasKeyword;
 }
 
-// --- 4. ניתוח, סינון ובדיקת כפילויות מול Gemini ---
+// --- 4. קריאה ל-Gemini עם מנגנון Retry ל-503 / 429 ---
+async function callGeminiWithRetry(params, maxRetries = 4) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return await ai.models.generateContent(params);
+    } catch (err) {
+      const msg = String(err?.message || "");
+      const isRetryable =
+        msg.includes("503") ||
+        msg.includes("429") ||
+        msg.includes("UNAVAILABLE") ||
+        msg.includes("RESOURCE_EXHAUSTED");
+      if (!isRetryable || attempt === maxRetries) throw err;
+      const delayMs = attempt * 2500;
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+  }
+}
+
+// --- 5. ניתוח, סינון ובדיקת כפילויות מול Gemini ---
 const responseSchema = {
   type: Type.OBJECT,
   properties: {
@@ -200,8 +220,8 @@ ${combinedText}
     });
   }
 
-  const response = await ai.models.generateContent({
-    model: "gemini-flash-lite-latest",
+  const response = await callGeminiWithRetry({
+    model: GEMINI_MODEL,
     contents,
     config: {
       responseMimeType: "application/json",
@@ -213,7 +233,7 @@ ${combinedText}
   return JSON.parse(response.text);
 }
 
-// --- 5. שליחת התראה מעוצבת לטלגרם ---
+// --- 6. שליחת התראה מעוצבת לטלגרם (טקסט רגיל למניעת שגיאות Markdown) ---
 async function sendTelegramAlert(jobAnalysis, groupName, rawText) {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;
@@ -227,22 +247,22 @@ async function sendTelegramAlert(jobAnalysis, groupName, rawText) {
       ? "חברה חסויה / חברת השמה"
       : jobAnalysis.normalized_company.toUpperCase();
 
-  const message = `🎯 *משרה חדשה מוואטסאפ!*
+  const message = `🎯 משרה חדשה מוואטסאפ!
 
-🏢 *חברה:* ${escapeMarkdown(companyDisplay)}
-💻 *תפקיד:* ${escapeMarkdown(jobAnalysis.job_title)}
-⏳ *ניסיון נדרש:* ${escapeMarkdown(jobAnalysis.experience_required)}
-📍 *מיקום:* ${escapeMarkdown(jobAnalysis.location || "לא צוין")}
-👥 *קבוצת מקור:* ${escapeMarkdown(groupName)}
+🏢 חברה: ${companyDisplay}
+💻 תפקיד: ${jobAnalysis.job_title}
+⏳ ניסיון נדרש: ${jobAnalysis.experience_required}
+📍 מיקום: ${jobAnalysis.location || "לא צוין"}
+👥 קבוצת מקור: ${groupName}
 
-📋 *תקציר ודרישות:*
-${escapeMarkdown(jobAnalysis.summary_hebrew)}
+📋 תקציר ודרישות:
+${jobAnalysis.summary_hebrew}
 
-📬 *איך מגישים:* \`${escapeMarkdown(jobAnalysis.contact_identifier)}\`
+📬 איך מגישים: ${jobAnalysis.contact_identifier}
 
 ---
-📝 *הודעה מקורית:*
-_${escapeMarkdown(rawText.slice(0, 500))}${rawText.length > 500 ? "..." : ""}_`;
+📝 הודעה מקורית:
+${rawText.slice(0, 500)}${rawText.length > 500 ? "..." : ""}`;
 
   const url = `https://api.telegram.org/bot${token}/sendMessage`;
   const res = await fetch(url, {
@@ -250,8 +270,7 @@ _${escapeMarkdown(rawText.slice(0, 500))}${rawText.length > 500 ? "..." : ""}_`;
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       chat_id: chatId,
-      text: message,
-      parse_mode: "Markdown"
+      text: message
     })
   });
 
@@ -263,11 +282,7 @@ _${escapeMarkdown(rawText.slice(0, 500))}${rawText.length > 500 ? "..." : ""}_`;
   }
 }
 
-function escapeMarkdown(text = "") {
-  return String(text).replace(/([_*`\[])/g, "\\$1");
-}
-
-// --- 6. עיבוד Batch של הודעות שנצברו מאותו שולח ---
+// --- 7. עיבוד Batch של הודעות שנצברו מאותו שולח ---
 async function processBufferedMessages(bufferKey) {
   const bundle = messageBuffers.get(bufferKey);
   messageBuffers.delete(bufferKey);
@@ -279,7 +294,6 @@ async function processBufferedMessages(bufferKey) {
   if (combinedText.length > 30) {
     const textHash = crypto.createHash("sha256").update(combinedText).digest("hex");
     if (seenState.textHashes[textHash]) {
-      console.log(`⏭️ דילוג: טקסט זהה כבר נסרק בעבר מקבוצה אחרת (${bundle.groupName}).`);
       return;
     }
     seenState.textHashes[textHash] = Date.now();
@@ -290,13 +304,13 @@ async function processBufferedMessages(bufferKey) {
     return;
   }
 
-  console.log(`🔍 מנתח הודעה מתוך "${bundle.groupName}" באמצעות Gemini...`);
+  console.log(`🔍 מנתח משרה פוטנציאלית (${bundle.groupName})...`);
 
   try {
     const result = await analyzeJobWithGemini(combinedText, bundle.images);
 
     if (!result.is_job_posting || !result.matches_candidate_profile) {
-      console.log(`➖ לא רלוונטי לפרופיל (${result.job_title || "לא משרה"}).`);
+      console.log(`➖ לא מתאים לפרופיל: ${result.job_title || "לא משרה רלוונטית"}`);
       return;
     }
 
@@ -310,7 +324,7 @@ async function processBufferedMessages(bufferKey) {
         : `contact::${contact}::${cat}`;
 
     if (seenState.fingerprints[fingerprint] || result.is_duplicate_of_existing) {
-      console.log(`♻️ משרה כפולה נחסמה: ${comp} - ${result.job_title} (${fingerprint})`);
+      console.log(`♻️ כפילות נחסמה: ${comp} - ${result.job_title}`);
       return;
     }
 
@@ -329,7 +343,7 @@ async function processBufferedMessages(bufferKey) {
   }
 }
 
-// --- 7. חיבור ל-WhatsApp והאזנה לאירועים ---
+// --- 8. חיבור ל-WhatsApp והאזנה לאירועים ---
 async function startWhatsAppAgent() {
   const { state, saveCreds } = await useMultiFileAuthState("./wa_auth_session");
 
@@ -357,16 +371,12 @@ async function startWhatsAppAgent() {
         setTimeout(startWhatsAppAgent, 5000);
       }
     } else if (connection === "open") {
-      console.log("✅ מחובר לוואטסאפ בהצלחה!");
       await refreshGithubJobsIfNeeded();
-
       const groups = await sock.groupFetchAllParticipating();
-      console.log("\n📋 רשימת קבוצות הוואטסאפ שלך (העתק את ה-JID הרלוונטיים ל-ALLOWED_GROUP_JIDS ב-.env):");
-      Object.values(groups).forEach((g) => {
-        const isWatched = ALLOWED_GROUPS.size === 0 || ALLOWED_GROUPS.has(g.id);
-        console.log(`   ${isWatched ? "🟢 [מאזין]" : "⚪ [מתעלם]"} ${g.subject}  -->  ${g.id}`);
-      });
-      console.log("\n🎧 מאזין להודעות חדשות בזמן אמת...\n");
+      const watchedCount = Object.values(groups).filter(
+        (g) => ALLOWED_GROUPS.size === 0 || ALLOWED_GROUPS.has(g.id)
+      ).length;
+      console.log(`🎧 מאזין ל-${watchedCount} קבוצות משרות בזמן אמת...`);
     }
   });
 

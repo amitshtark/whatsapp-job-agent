@@ -18,7 +18,7 @@ dotenv.config();
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 const SEEN_FILE_PATH = "./whatsapp_seen.json";
 const DEBOUNCE_MS = (Number(process.env.DEBOUNCE_SECONDS) || 40) * 1000;
-const GITHUB_REFRESH_MS = 30 * 60 * 1000; // רענון משרות מהאתר כל 30 דקות
+const GITHUB_REFRESH_MS = 30 * 60 * 1000;
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-flash-lite-latest";
 
 const ALLOWED_GROUPS = new Set(
@@ -28,10 +28,13 @@ const ALLOWED_GROUPS = new Set(
     .filter(Boolean)
 );
 
-// זיכרון פנימי למניעת כפילויות וצבירת הודעות
 let githubJobsCache = [];
 let lastGithubFetch = 0;
-const messageBuffers = new Map(); // key: `${groupJid}_${senderJid}`
+const messageBuffers = new Map();
+
+let activeSock = null;
+let isReconnecting = false;
+let reconnectTimer = null;
 
 // --- 1. ניהול זיכרון מקומי (whatsapp_seen.json) ---
 function loadSeenJobs() {
@@ -93,32 +96,31 @@ function buildExistingJobsContext() {
   return [...siteJobs, ...recentWhatsapp].join("\n");
 }
 
-// --- 3. סינון ראשוני מהיר (לפני קריאת AI) ---
+// --- 3. סינון ראשוני מהיר ---
 function passesPreFilter(combinedText, hasImage) {
   const clean = combinedText.trim().toLowerCase();
   if (hasImage && clean.length < 25) return true;
   if (clean.length < 25) return false;
 
-  const hasKeyword = USER_PREFERENCES.preFilterKeywords.some((kw) =>
+  return USER_PREFERENCES.preFilterKeywords.some((kw) =>
     clean.includes(kw.toLowerCase())
   );
-  return hasKeyword;
 }
 
-// --- 4. קריאה ל-Gemini עם מנגנון Retry ל-503 / 429 ---
+// --- 4. קריאה ל-Gemini עם Retry משופר ל-503 / 429 ---
 async function callGeminiWithRetry(params, maxRetries = 4) {
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
       return await ai.models.generateContent(params);
     } catch (err) {
-      const msg = String(err?.message || "");
+      const serialized = `${err?.message || ""} ${JSON.stringify(err || {})}`;
       const isRetryable =
-        msg.includes("503") ||
-        msg.includes("429") ||
-        msg.includes("UNAVAILABLE") ||
-        msg.includes("RESOURCE_EXHAUSTED");
+        serialized.includes("503") ||
+        serialized.includes("429") ||
+        serialized.includes("UNAVAILABLE") ||
+        serialized.includes("RESOURCE_EXHAUSTED");
       if (!isRetryable || attempt === maxRetries) throw err;
-      const delayMs = attempt * 2500;
+      const delayMs = attempt * 3000;
       await new Promise((r) => setTimeout(r, delayMs));
     }
   }
@@ -233,7 +235,7 @@ ${combinedText}
   return JSON.parse(response.text);
 }
 
-// --- 6. שליחת התראה מעוצבת לטלגרם (טקסט רגיל למניעת שגיאות Markdown) ---
+// --- 6. שליחת התראה מעוצבת לטלגרם ---
 async function sendTelegramAlert(jobAnalysis, groupName, rawText) {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;
@@ -343,16 +345,40 @@ async function processBufferedMessages(bufferKey) {
   }
 }
 
+function scheduleReconnect(delayMs = 8000) {
+  if (isReconnecting) return;
+  isReconnecting = true;
+
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(() => {
+    isReconnecting = false;
+    startWhatsAppAgent();
+  }, delayMs);
+}
+
 // --- 8. חיבור ל-WhatsApp והאזנה לאירועים ---
 async function startWhatsAppAgent() {
+  if (activeSock) {
+    try {
+      activeSock.ev.removeAllListeners("connection.update");
+      activeSock.ev.removeAllListeners("messages.upsert");
+      activeSock.ev.removeAllListeners("creds.update");
+      activeSock.end(undefined);
+    } catch {}
+    activeSock = null;
+  }
+
   const { state, saveCreds } = await useMultiFileAuthState("./wa_auth_session");
 
   const sock = makeWASocket({
     auth: state,
     logger: pino({ level: "silent" }),
-    printQRInTerminal: false
+    printQRInTerminal: false,
+    connectTimeoutMs: 60000,
+    keepAliveIntervalMs: 25000
   });
 
+  activeSock = sock;
   sock.ev.on("creds.update", saveCreds);
 
   sock.ev.on("connection.update", async (update) => {
@@ -368,9 +394,11 @@ async function startWhatsAppAgent() {
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
       console.log(`⚠️ החיבור לוואטסאפ נסגר (קוד ${statusCode}). מתחבר מחדש: ${shouldReconnect}`);
       if (shouldReconnect) {
-        setTimeout(startWhatsAppAgent, 5000);
+        const delay = statusCode === 408 ? 10000 : 5000;
+        scheduleReconnect(delay);
       }
     } else if (connection === "open") {
+      isReconnecting = false;
       await refreshGithubJobsIfNeeded();
       const groups = await sock.groupFetchAllParticipating();
       const watchedCount = Object.values(groups).filter(

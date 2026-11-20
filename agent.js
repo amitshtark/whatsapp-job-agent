@@ -6,8 +6,6 @@ import makeWASocket, {
 import { Boom } from "@hapi/boom";
 import pino from "pino";
 import qrcode from "qrcode-terminal";
-import fs from "fs";
-import crypto from "crypto";
 import dotenv from "dotenv";
 import { GoogleGenAI, Type } from "@google/genai";
 import { USER_PREFERENCES } from "./config.js";
@@ -16,9 +14,7 @@ dotenv.config();
 
 // --- אתחול והגדרות קבועות ---
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-const SEEN_FILE_PATH = "./whatsapp_seen.json";
-const DEBOUNCE_MS = (Number(process.env.DEBOUNCE_SECONDS) || 40) * 1000;
-const GITHUB_REFRESH_MS = 30 * 60 * 1000;
+const DEBOUNCE_MS = 2500;
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-flash-lite-latest";
 
 const ALLOWED_GROUPS = new Set(
@@ -28,86 +24,14 @@ const ALLOWED_GROUPS = new Set(
     .filter(Boolean)
 );
 
-let githubJobsCache = [];
-let lastGithubFetch = 0;
 const messageBuffers = new Map();
+let messageSequence = 0;
 
 let activeSock = null;
 let isReconnecting = false;
 let reconnectTimer = null;
 
-// --- 1. ניהול זיכרון מקומי (whatsapp_seen.json) ---
-function loadSeenJobs() {
-  if (!fs.existsSync(SEEN_FILE_PATH)) {
-    return { fingerprints: {}, textHashes: {} };
-  }
-  try {
-    const data = JSON.parse(fs.readFileSync(SEEN_FILE_PATH, "utf-8"));
-    const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
-    for (const [k, v] of Object.entries(data.fingerprints || {})) {
-      if (v.timestamp < cutoff) delete data.fingerprints[k];
-    }
-    for (const [k, ts] of Object.entries(data.textHashes || {})) {
-      if (ts < cutoff) delete data.textHashes[k];
-    }
-    return data;
-  } catch (err) {
-    console.error("⚠️ שגיאה בטעינת whatsapp_seen.json, מאתחל מחדש:", err.message);
-    return { fingerprints: {}, textHashes: {} };
-  }
-}
-
-function saveSeenJobs(seenData) {
-  fs.writeFileSync(SEEN_FILE_PATH, JSON.stringify(seenData, null, 2), "utf-8");
-}
-
-let seenState = loadSeenJobs();
-
-// --- 2. משיכת משרות מהאתר הציבורי ב-GitHub (קריאה בלבד) ---
-async function refreshGithubJobsIfNeeded() {
-  const url = process.env.GITHUB_JOBS_RAW_URL;
-  if (!url) return;
-  if (Date.now() - lastGithubFetch < GITHUB_REFRESH_MS && githubJobsCache.length > 0) {
-    return;
-  }
-  try {
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    githubJobsCache = Array.isArray(data) ? data : data.jobs || Object.values(data);
-    lastGithubFetch = Date.now();
-    console.log(`🔄 סונכרנו ${githubJobsCache.length} משרות קיימות מתוך GitHub.`);
-  } catch (err) {
-    console.warn(`⚠️ לא ניתן למשוך משרות מ-GitHub כעת (${err.message}). ממשיך עם Cache קיים.`);
-  }
-}
-
-function buildExistingJobsContext() {
-  const recentWhatsapp = Object.values(seenState.fingerprints)
-    .slice(-60)
-    .map((j) => `[WhatsApp] Company: ${j.company} | Role: ${j.title} | Contact: ${j.contact}`);
-
-  const siteJobs = githubJobsCache.slice(0, 250).map((j) => {
-    const comp = j.company || j.company_name || "Unknown";
-    const title = j.title || j.role || j.name || "Unknown";
-    return `[CareerSite] Company: ${comp} | Role: ${title}`;
-  });
-
-  return [...siteJobs, ...recentWhatsapp].join("\n");
-}
-
-// --- 3. סינון ראשוני מהיר ---
-function passesPreFilter(combinedText, hasImage) {
-  const clean = combinedText.trim().toLowerCase();
-  if (hasImage && clean.length < 25) return true;
-  if (clean.length < 25) return false;
-
-  return USER_PREFERENCES.preFilterKeywords.some((kw) =>
-    clean.includes(kw.toLowerCase())
-  );
-}
-
-// --- 4. קריאה ל-Gemini עם Retry משופר ל-503 / 429 ---
+// --- Gemini request with retry for 503 / 429 ---
 async function callGeminiWithRetry(params, maxRetries = 4) {
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
@@ -126,89 +50,32 @@ async function callGeminiWithRetry(params, maxRetries = 4) {
   }
 }
 
-// --- 5. ניתוח, סינון ובדיקת כפילויות מול Gemini ---
+// --- Binary forwarding classification ---
 const responseSchema = {
   type: Type.OBJECT,
   properties: {
-    is_job_posting: {
+    should_forward: {
       type: Type.BOOLEAN,
-      description: "True ONLY if the message is offering one or more tech job positions."
-    },
-    matches_candidate_profile: {
-      type: Type.BOOLEAN,
-      description: "True if the role matches Software/Fullstack/Backend/Frontend/AI Engineer AND requires <= 2 years of experience (or is Junior/Entry/Student/Grad)."
-    },
-    is_duplicate_of_existing: {
-      type: Type.BOOLEAN,
-      description: "True if this exact role at this company already appears in the provided Existing Jobs list."
-    },
-    normalized_company: {
-      type: Type.STRING,
-      description: "Company name in lowercase English without suffixes (e.g., 'wiz', 'monday', 'lightricks'). If confidential/not mentioned, return 'unknown'."
-    },
-    role_category: {
-      type: Type.STRING,
-      description: "One of: 'fullstack', 'backend', 'frontend', 'ai_engineer', 'software_engineer', 'other'."
-    },
-    job_title: {
-      type: Type.STRING,
-      description: "Clean job title (e.g., 'Junior Full Stack Developer')."
-    },
-    experience_required: {
-      type: Type.STRING,
-      description: "Short note on required experience (e.g., '0-2 years', 'Graduate', 'Not specified')."
-    },
-    location: {
-      type: Type.STRING,
-      description: "Job location if mentioned (e.g., 'תל אביב / היברידי')."
-    },
-    contact_identifier: {
-      type: Type.STRING,
-      description: "Normalized email, link, or phone number to apply (lowercase). If none, return 'none'."
-    },
-    summary_hebrew: {
-      type: Type.STRING,
-      description: "2-3 concise bullet points in Hebrew summarizing tech stack, requirements, and how to apply."
+      description: "True for a job matching or plausibly/borderline matching the candidate profile; false for a clear non-job or obvious mismatch."
     }
   },
-  required: [
-    "is_job_posting",
-    "matches_candidate_profile",
-    "is_duplicate_of_existing",
-    "normalized_company",
-    "role_category",
-    "job_title",
-    "experience_required",
-    "location",
-    "contact_identifier",
-    "summary_hebrew"
-  ]
+  required: ["should_forward"]
 };
 
-async function analyzeJobWithGemini(combinedText, imageBuffers) {
-  await refreshGithubJobsIfNeeded();
-  const existingContext = buildExistingJobsContext();
-
+async function shouldForwardWithGemini(messageText, imageBuffers) {
   const prompt = `
-You are an expert technical recruiter and job-matching agent for a Computer Science B.Sc. graduate & AI Engineer in Israel.
+You are a binary forwarding classifier for incoming WhatsApp group messages.
 
-CANDIDATE TARGET PROFILE:
-- Desired Roles: ${USER_PREFERENCES.targetRoles.join(", ")}
-- Experience Level: Junior / Graduate / Entry-level / Up to ${USER_PREFERENCES.maxExperienceYears} years of experience. (Reject roles strictly requiring 3+ years).
-- Excluded Roles: QA Manual, IT/Helpdesk, Product, Marketing, Sales, DevOps-only (unless software/AI focused).
+Candidate profile:
+- Target roles: ${USER_PREFERENCES.targetRoles.join(", ")}
+- Experience: up to ${USER_PREFERENCES.maxExperienceYears} years
+- Clear exclusions: ${USER_PREFERENCES.excludedKeywords.join(", ")}
 
-EXISTING JOBS ALREADY TRACKED (Career Pages & Previous WhatsApp Alerts):
-${existingContext || "None yet."}
+Return should_forward=true only for a job matching or plausibly/borderline matching this profile. Return false for clear non-jobs and obvious mismatches. If job or candidate fit is uncertain, return true. Do not extract, summarize, rewrite, or return any message fields.
 
-TASK:
-Analyze the attached WhatsApp message (and any attached flyer image).
-1. Determine if it is a job posting and if it fits the candidate profile.
-2. Check if this job is already listed in the EXISTING JOBS list above (match by company + same role category/title).
-3. Extract normalized metadata for deduplication and a clean Hebrew summary.
-
-WHATSAPP MESSAGE TEXT:
+WhatsApp message text:
 ---
-${combinedText}
+${messageText}
 ---
 `;
 
@@ -232,11 +99,14 @@ ${combinedText}
     }
   });
 
-  return JSON.parse(response.text);
+  const result = JSON.parse(response.text);
+  if (typeof result.should_forward !== "boolean") {
+    throw new Error("Gemini response is missing boolean should_forward");
+  }
+  return result.should_forward;
 }
 
-// --- 6. שליחת התראה מעוצבת לטלגרם ---
-async function sendTelegramAlert(jobAnalysis, groupName, rawText) {
+async function sendTelegramAlert(groupName, senderPhone, messagePhone, date, messageText) {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;
   if (!token || !chatId) {
@@ -244,105 +114,189 @@ async function sendTelegramAlert(jobAnalysis, groupName, rawText) {
     return;
   }
 
-  const companyDisplay =
-    jobAnalysis.normalized_company === "unknown"
-      ? "חברה חסויה / חברת השמה"
-      : jobAnalysis.normalized_company.toUpperCase();
-
-  const message = `🎯 משרה חדשה מוואטסאפ!
-
-🏢 חברה: ${companyDisplay}
-💻 תפקיד: ${jobAnalysis.job_title}
-⏳ ניסיון נדרש: ${jobAnalysis.experience_required}
-📍 מיקום: ${jobAnalysis.location || "לא צוין"}
-👥 קבוצת מקור: ${groupName}
-
-📋 תקציר ודרישות:
-${jobAnalysis.summary_hebrew}
-
-📬 איך מגישים: ${jobAnalysis.contact_identifier}
-
----
-📝 הודעה מקורית:
-${rawText.slice(0, 500)}${rawText.length > 500 ? "..." : ""}`;
+  const message = `group name: ${groupName}
+sender phone number: ${senderPhone}
+phone number in message: ${messagePhone}
+date: ${date}
+message: ${messageText}`;
 
   const url = `https://api.telegram.org/bot${token}/sendMessage`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      chat_id: chatId,
-      text: message
-    })
-  });
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: message
+      })
+    });
 
-  if (!res.ok) {
-    const errText = await res.text();
-    console.error("❌ שגיאה בשליחת הודעת טלגרם:", errText);
-  } else {
-    console.log(`✅ נשלחה התראה לטלגרם: ${companyDisplay} - ${jobAnalysis.job_title}`);
+    if (!res.ok) {
+      const errText = await res.text();
+      console.error("❌ שגיאה בשליחת הודעת טלגרם:", errText);
+    } else {
+      console.log(`✅ נשלחה התראה לטלגרם עבור ${groupName}.`);
+    }
+  } catch (err) {
+    console.error("❌ שגיאה בשליחת הודעת טלגרם:", err.message);
   }
 }
 
-// --- 7. עיבוד Batch של הודעות שנצברו מאותו שולח ---
+// --- Process messages batched by group and sender ---
 async function processBufferedMessages(bufferKey) {
   const bundle = messageBuffers.get(bufferKey);
   messageBuffers.delete(bufferKey);
   if (!bundle) return;
 
-  const combinedText = bundle.texts.join("\n---\n").trim();
-  const hasImage = bundle.images.length > 0;
-
-  if (combinedText.length > 30) {
-    const textHash = crypto.createHash("sha256").update(combinedText).digest("hex");
-    if (seenState.textHashes[textHash]) {
-      return;
-    }
-    seenState.textHashes[textHash] = Date.now();
-    saveSeenJobs(seenState);
-  }
-
-  if (!passesPreFilter(combinedText, hasImage)) {
-    return;
-  }
-
-  console.log(`🔍 מנתח משרה פוטנציאלית (${bundle.groupName})...`);
-
+  const parts = bundle.parts.sort((a, b) => a.sequence - b.sequence);
+  const messageText = parts.map((part) => part.text).filter(Boolean).join("\n");
+  const imageBuffers = parts.flatMap((part) => part.images);
   try {
-    const result = await analyzeJobWithGemini(combinedText, bundle.images);
-
-    if (!result.is_job_posting || !result.matches_candidate_profile) {
-      console.log(`➖ לא מתאים לפרופיל: ${result.job_title || "לא משרה רלוונטית"}`);
-      return;
+    const shouldForward = await shouldForwardWithGemini(messageText, imageBuffers);
+    if (shouldForward) {
+      await sendTelegramAlert(
+        bundle.groupName,
+        bundle.senderPhone,
+        extractPhoneNumberFromText(messageText),
+        bundle.date,
+        messageText
+      );
     }
-
-    const comp = (result.normalized_company || "unknown").toLowerCase().trim();
-    const cat = (result.role_category || "other").toLowerCase().trim();
-    const contact = (result.contact_identifier || "none").toLowerCase().trim();
-
-    const fingerprint =
-      comp !== "unknown"
-        ? `company::${comp}::${cat}`
-        : `contact::${contact}::${cat}`;
-
-    if (seenState.fingerprints[fingerprint] || result.is_duplicate_of_existing) {
-      console.log(`♻️ כפילות נחסמה: ${comp} - ${result.job_title}`);
-      return;
-    }
-
-    seenState.fingerprints[fingerprint] = {
-      company: comp,
-      title: result.job_title,
-      contact,
-      group: bundle.groupName,
-      timestamp: Date.now()
-    };
-    saveSeenJobs(seenState);
-
-    await sendTelegramAlert(result, bundle.groupName, combinedText);
   } catch (err) {
-    console.error("❌ שגיאה בניתוח הודעה מול Gemini:", err.message);
+    console.error("❌ שגיאה בסיווג או העברת הודעה:", err.message);
   }
+}
+
+function phoneFromIdentifier(identifier) {
+  if (typeof identifier !== "string" && typeof identifier !== "number" &&
+      typeof identifier !== "bigint") return null;
+
+  const value = String(identifier).trim();
+  if (!value) return null;
+
+  let phone = value;
+  if (value.includes("@")) {
+    const [user, server] = value.split("@");
+    if (!["s.whatsapp.net", "c.us"].includes(server?.toLowerCase())) return null;
+    phone = user.split(":")[0];
+  } else {
+    phone = value.split(":")[0];
+    if (!/^\+?\d+$/.test(phone)) return null;
+  }
+
+  const digits = phone.replace(/\D/g, "");
+  return digits.length >= 7 && digits.length <= 15 ? `+${digits}` : null;
+}
+
+function extractSenderPhone(msg, user) {
+  const key = msg.key || {};
+  const candidates = [];
+  const addPhoneFields = (record) => {
+    if (!record || typeof record !== "object") return;
+    for (const [field, value] of Object.entries(record)) {
+      if (/(pn|jid|lid|participant|sender|phone)/i.test(field)) {
+        candidates.push(value);
+      }
+    }
+  };
+
+  if (key.fromMe) {
+    candidates.push(user?.id, user?.pn, user?.jid, user?.phoneNumber, user?.lid);
+    addPhoneFields(user);
+  }
+  candidates.push(
+    key.participant,
+    key.participantAlt,
+    msg.participant,
+    msg.participantPn,
+    msg.participantJid,
+    msg.participantLid
+  );
+  addPhoneFields(msg);
+  addPhoneFields(key);
+  if (!key.fromMe) {
+    candidates.push(user?.id, user?.pn, user?.jid, user?.phoneNumber, user?.lid);
+    addPhoneFields(user);
+  }
+
+  for (const candidate of candidates) {
+    const phone = phoneFromIdentifier(candidate);
+    if (phone) return phone;
+  }
+  return "unknown";
+}
+
+function extractPhoneNumberFromText(text) {
+  const candidates = text.match(/(?<!\d)\+?\d(?:[\d\s().-]{5,}\d)(?!\d)/g) || [];
+  for (const candidate of candidates) {
+    const digits = candidate.replace(/\D/g, "");
+    const isInternational = candidate.trim().startsWith("+") &&
+      digits.length >= 8 && digits.length <= 15;
+    const isIsraeliMobile = /^05\d{8}$/.test(digits);
+    const isIsraeliLandline = /^0(?:2|3|4|8|9)\d{7}$/.test(digits) ||
+      /^07\d{8}$/.test(digits);
+    if (isInternational || isIsraeliMobile || isIsraeliLandline) {
+      return candidate.trim();
+    }
+  }
+  return "empty";
+}
+
+function formatMessageDate(timestamp) {
+  const formatInJerusalem = (date) => {
+    const parts = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Asia/Jerusalem",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23"
+    }).formatToParts(date);
+    const values = Object.fromEntries(parts.map(({ type, value }) => [type, value]));
+    return `${values.year}-${values.month}-${values.day} ${values.hour}:${values.minute}`;
+  };
+
+  let value;
+  try {
+    if (typeof timestamp === "bigint") {
+      value = Number(timestamp);
+    } else if (typeof timestamp === "number" || typeof timestamp === "string") {
+      value = Number(timestamp);
+    } else if (timestamp && typeof timestamp === "object") {
+      if (typeof timestamp.toNumber === "function") {
+        value = timestamp.toNumber();
+      } else if (timestamp.seconds !== undefined) {
+        value = Number(timestamp.seconds);
+      } else if (timestamp.low !== undefined && timestamp.high !== undefined) {
+        value = Number((BigInt(timestamp.high) << 32n) | BigInt(timestamp.low >>> 0));
+      }
+    }
+
+    if (!Number.isFinite(value) || value <= 0) throw new Error("Invalid message timestamp");
+    const milliseconds = value > 1e12 ? value : value * 1000;
+    const date = new Date(milliseconds);
+    if (Number.isNaN(date.getTime())) throw new Error("Invalid message date");
+    return formatInJerusalem(date);
+  } catch {
+    return formatInJerusalem(new Date());
+  }
+}
+
+function unwrapMessageContent(message) {
+  let content = message;
+  for (let depth = 0; depth < 5; depth++) {
+    const wrapped =
+      content?.ephemeralMessage?.message ||
+      content?.viewOnceMessage?.message ||
+      content?.viewOnceMessageV2?.message ||
+      content?.viewOnceMessageV2Extension?.message ||
+      content?.documentWithCaptionMessage?.message ||
+      content?.editedMessage?.message;
+    if (!wrapped) break;
+    content = wrapped;
+  }
+  return content || {};
 }
 
 function scheduleReconnect(delayMs = 8000) {
@@ -356,7 +310,7 @@ function scheduleReconnect(delayMs = 8000) {
   }, delayMs);
 }
 
-// --- 8. חיבור ל-WhatsApp והאזנה לאירועים ---
+// --- WhatsApp connection and message handling ---
 async function startWhatsAppAgent() {
   if (activeSock) {
     try {
@@ -399,7 +353,6 @@ async function startWhatsAppAgent() {
       }
     } else if (connection === "open") {
       isReconnecting = false;
-      await refreshGithubJobsIfNeeded();
       const groups = await sock.groupFetchAllParticipating();
       const watchedCount = Object.values(groups).filter(
         (g) => ALLOWED_GROUPS.size === 0 || ALLOWED_GROUPS.has(g.id)
@@ -408,61 +361,69 @@ async function startWhatsAppAgent() {
     }
   });
 
-  sock.ev.on("messages.upsert", async ({ messages, type }) => {
-    if (type !== "notify") return;
-
+  sock.ev.on("messages.upsert", async ({ messages }) => {
     for (const msg of messages) {
       const remoteJid = msg.key.remoteJid;
       if (!remoteJid || !remoteJid.endsWith("@g.us")) continue;
-      if (msg.key.fromMe) continue;
-
       if (ALLOWED_GROUPS.size > 0 && !ALLOWED_GROUPS.has(remoteJid)) continue;
 
-      const text =
-        msg.message?.conversation ||
-        msg.message?.extendedTextMessage?.text ||
-        msg.message?.imageMessage?.caption ||
-        msg.message?.documentWithCaptionMessage?.message?.documentMessage?.caption ||
+      const content = unwrapMessageContent(msg.message);
+      const messageText =
+        content.conversation ||
+        content.extendedTextMessage?.text ||
+        content.imageMessage?.caption ||
+        content.videoMessage?.caption ||
+        content.documentMessage?.caption ||
         "";
 
-      const isImage = Boolean(msg.message?.imageMessage);
-      if (!text && !isImage) continue;
+      const isImage = Boolean(content.imageMessage);
+      const senderJid = msg.key.participant || msg.key.participantAlt || msg.participant || "";
+      const sequence = messageSequence++;
+      const bufferKey = `${remoteJid}_${senderJid || msg.key.id || `unknown_${sequence}`}`;
+      let bundle = messageBuffers.get(bufferKey);
 
-      const sender = msg.key.participant || "unknown_sender";
-      const bufferKey = `${remoteJid}_${sender}`;
-
-      let groupName = remoteJid;
-      try {
-        const meta = await sock.groupMetadata(remoteJid);
-        groupName = meta.subject;
-      } catch {}
-
-      if (!messageBuffers.has(bufferKey)) {
-        messageBuffers.set(bufferKey, {
-          groupName,
-          texts: [],
-          images: [],
+      if (!bundle) {
+        bundle = {
+          groupName: remoteJid,
+          senderPhone: extractSenderPhone(msg, sock.user),
+          date: formatMessageDate(msg.messageTimestamp),
+          parts: [],
+          pending: 0,
           timer: null
-        });
+        };
+        messageBuffers.set(bufferKey, bundle);
+      }
+      if (bundle.senderPhone === "unknown") {
+        bundle.senderPhone = extractSenderPhone(msg, sock.user);
+      }
+      const part = { sequence, text: messageText, images: [] };
+      bundle.parts.push(part);
+      bundle.pending++;
+      if (bundle.timer) clearTimeout(bundle.timer);
+
+      if (bundle.parts.length === 1) {
+        try {
+          const meta = await sock.groupMetadata(remoteJid);
+          bundle.groupName = meta.subject || remoteJid;
+        } catch (err) {
+          console.warn(`⚠️ לא ניתן לקבל את שם הקבוצה (${remoteJid}):`, err.message);
+        }
       }
 
-      const bundle = messageBuffers.get(bufferKey);
-      if (text) bundle.texts.push(text);
-
-      if (isImage && bundle.images.length < 2) {
+      if (isImage) {
         try {
           const buffer = await downloadMediaMessage(msg, "buffer", {});
-          const mimeType = msg.message.imageMessage.mimetype || "image/jpeg";
-          bundle.images.push({ buffer, mimeType });
+          const mimeType = content.imageMessage.mimetype || "image/jpeg";
+          part.images.push({ buffer, mimeType });
         } catch (err) {
           console.warn("⚠️ לא ניתן להוריד תמונה מההודעה:", err.message);
         }
       }
 
-      if (bundle.timer) clearTimeout(bundle.timer);
-      bundle.timer = setTimeout(() => {
-        processBufferedMessages(bufferKey);
-      }, DEBOUNCE_MS);
+      bundle.pending--;
+      if (bundle.pending === 0) {
+        bundle.timer = setTimeout(() => processBufferedMessages(bufferKey), DEBOUNCE_MS);
+      }
     }
   });
 }
